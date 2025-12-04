@@ -11,7 +11,7 @@ import plotly.graph_objects as go
 CONTRACT_SIZE = 100
 
 
-# -------- Black-Scholes Basics --------
+# -------- Black Scholes Basics --------
 
 def year_fraction(expiry_date: dt.date, valuation_date: dt.date = None) -> float:
     if valuation_date is None:
@@ -114,7 +114,7 @@ def compute_greeks_for_row(row, valuation_date=None):
     delta = bs_delta(S, K, T, r, sigma, option_type)
     gamma = bs_gamma(S, K, T, r, sigma)
     vega = bs_vega(S, K, T, r, sigma)
-    theta = bs_theta(S, K, T, r, sigma)
+    theta = bs_theta(S, K, T, r, sigma, option_type)
 
     return price, delta, gamma, vega, theta, T
 
@@ -142,7 +142,7 @@ def aggregate_portfolio(df: pd.DataFrame):
     }
 
 
-# -------- Szenario-Engine --------
+# -------- Szenario Engine --------
 
 def run_scenario(
     df: pd.DataFrame,
@@ -156,9 +156,7 @@ def run_scenario(
 
     df_scen = df.copy()
 
-    # Spot-Schock in Prozent
     df_scen["spot"] = df_scen["spot"] * (1.0 + spot_shock)
-    # IV-Schock in absoluten Punkten, nicht in Prozent
     df_scen["iv"] = np.maximum(df_scen["iv"] + iv_shock, 0.0001)
 
     if days_forward != 0:
@@ -256,13 +254,133 @@ def scenario_barplot(df_scen: pd.DataFrame):
     return fig
 
 
+# -------- Monte Carlo Greeks at Risk Funktionen --------
+
+def portfolio_greeks(portfolio_df: pd.DataFrame) -> pd.DataFrame:
+    records = []
+
+    for _, row in portfolio_df.iterrows():
+        S0 = row["spot"]
+        K = row["strike"]
+        T = year_fraction(row["expiry"])
+        sigma0 = row["iv"]
+        r = row["r"]
+        qty = row["quantity"]
+        side = 1 if row["side"] == "long" else -1
+        opt_type = row["option_type"]
+
+        price = bs_price(S0, K, T, r, sigma0, opt_type)
+        delta = bs_delta(S0, K, T, r, sigma0, opt_type)
+        gamma = bs_gamma(S0, K, T, r, sigma0)  # nur 5 Argumente
+        vega = bs_vega(S0, K, T, r, sigma0)
+        theta = bs_theta(S0, K, T, r, sigma0, opt_type)
+
+        records.append(
+            {
+                "underlying": row["underlying"],
+                "S0": S0,
+                "sigma0": sigma0,
+                "delta": delta * qty * side * CONTRACT_SIZE,
+                "gamma": gamma * qty * side * CONTRACT_SIZE,
+                "vega": vega * qty * side * CONTRACT_SIZE,
+                "theta": theta * qty * side * CONTRACT_SIZE,
+                "position_value": price * qty * side * CONTRACT_SIZE,
+            }
+        )
+
+    return pd.DataFrame(records)
+
+
+def simulate_greeks_at_risk(
+    greeks_df: pd.DataFrame,
+    horizon_days=1,
+    n_sims=10000,
+    spot_vol_scale=1.0,
+    iv_vol_scale=0.3,
+    corr_matrix=None,
+    random_seed=42,
+):
+    np.random.seed(random_seed)
+
+    underlyings = greeks_df["underlying"].unique()
+    n_u = len(underlyings)
+
+    S0_vec = np.zeros(n_u)
+    sigma0_vec = np.zeros(n_u)
+
+    for i, u in enumerate(underlyings):
+        sub = greeks_df[greeks_df["underlying"] == u]
+        S0_vec[i] = sub["S0"].iloc[0]
+        sigma0_vec[i] = sub["sigma0"].mean()
+
+    dt_years = horizon_days / 252.0
+    sigma_S = sigma0_vec * spot_vol_scale
+    sigma_S_dt = sigma_S * np.sqrt(dt_years)
+
+    sigma_iv = sigma0_vec * iv_vol_scale * np.sqrt(dt_years)
+
+    if corr_matrix is None:
+        corr_matrix = np.eye(n_u)
+
+    cov_S = np.outer(sigma_S_dt, sigma_S_dt) * corr_matrix
+
+    dS_rel = np.random.multivariate_normal(
+        mean=np.zeros(n_u),
+        cov=cov_S,
+        size=n_sims,
+    )
+    dS = dS_rel * S0_vec
+
+    dSigma = np.random.normal(
+        loc=0.0,
+        scale=sigma_iv,
+        size=(n_sims, n_u),
+    )
+
+    dT = -dt_years
+
+    pnl = np.zeros(n_sims)
+
+    for i, u in enumerate(underlyings):
+        sub = greeks_df[greeks_df["underlying"] == u]
+        delta_u = sub["delta"].values
+        gamma_u = sub["gamma"].values
+        vega_u = sub["vega"].values
+        theta_u = sub["theta"].values
+
+        dS_u = dS[:, i].reshape(-1, 1)
+        dSigma_u = dSigma[:, i].reshape(-1, 1)
+
+        dP = (
+            delta_u * dS_u
+            + 0.5 * gamma_u * (dS_u ** 2)
+            + vega_u * dSigma_u
+            + theta_u * dT
+        )
+
+        pnl += dP.sum(axis=1)
+
+    return pnl
+
+
+def var_es_from_pnl(pnl, alpha=0.95):
+    pnl_sorted = np.sort(pnl)
+    n = len(pnl_sorted)
+    var_index = int((1 - alpha) * n)
+
+    var_level = -pnl_sorted[var_index]
+    es_level = -pnl_sorted[:var_index].mean()
+
+    return var_level, es_level
+
+
 # -------- Streamlit App --------
 
 def main():
-    st.set_page_config(page_title="Options Greeks-at-Risk Dashboard", layout="wide")
+    st.set_page_config(page_title="Options Greeks at Risk Dashboard", layout="wide")
 
-    st.title("Options Greeks-at-Risk Dashboard by Elias Benhachmi")
-    st.caption("Delta / Gamma / Vega / Theta unter Spot- und Vol-Schocks.")
+    st.title("Options Greeks at Risk Dashboard by Elias Benhachmi")
+    st.caption("Delta / Gamma / Vega / Theta unter Spot und Vol Schocks.")
 
     st.sidebar.header("Portfolio Input")
     upload = st.sidebar.file_uploader("Portfolio CSV hochladen", type=["csv"])
@@ -293,7 +411,7 @@ def main():
     df_base = apply_sign_and_size(df_base)
     base_agg = aggregate_portfolio(df_base)
 
-    st.subheader("Basis-Greeks aggregiert")
+    st.subheader("Basis Greeks aggregiert")
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Portfolio Value", f"{base_agg['portfolio_value']:.2f}")
     c2.metric("Delta", f"{base_agg['delta']:.2f}")
@@ -327,7 +445,7 @@ def main():
             ]
         )
 
-    st.subheader("Szenario-Analyse & Greeks-at-Risk")
+    st.subheader("Szenario Analyse und Greeks at Risk")
     scenario_dict = build_scenario_set()
     scenario_aggs = {"Base": base_agg}
     scenario_details = {"Base": df_base}
@@ -346,7 +464,7 @@ def main():
         scenario_details[name] = df_s
 
     df_gar = compute_greeks_at_risk(base_agg, scenario_aggs)
-    st.write("Greeks-at-Risk relativ zur Basis")
+    st.write("Greeks at Risk relativ zur Basis")
     st.dataframe(df_gar)
 
     fig_scen = scenario_barplot(df_gar)
@@ -357,9 +475,9 @@ def main():
     if fig_gamma is not None:
         st.plotly_chart(fig_gamma, use_container_width=True)
     else:
-        st.info("Nicht genug Daten für Gamma-Heatmap.")
+        st.info("Nicht genug Daten für Gamma Heatmap.")
 
-    st.subheader("Szenario-Details")
+    st.subheader("Szenario Details")
     selected = st.selectbox("Szenario wählen", list(scenario_aggs.keys()))
     agg_sel = scenario_aggs[selected]
 
@@ -396,8 +514,38 @@ def main():
             ]
         )
 
+    # Monte Carlo Block
+    with st.expander("Monte Carlo Greeks at Risk"):
+        horizon_days = st.slider("Risk Horizont (Tage)", 1, 20, 1, key="mc_horizon")
+        n_sims = st.selectbox(
+            "Anzahl Simulationen", [1000, 5000, 10000], index=2, key="mc_nsims"
+        )
+
+        if st.button("Greeks at Risk simulieren", key="mc_button"):
+            current_portfolio_df = scenario_details[selected].copy()
+            greeks_df = portfolio_greeks(current_portfolio_df)
+            pnl = simulate_greeks_at_risk(
+                greeks_df,
+                horizon_days=horizon_days,
+                n_sims=n_sims,
+            )
+
+            var95, es95 = var_es_from_pnl(pnl, alpha=0.95)
+            var99, es99 = var_es_from_pnl(pnl, alpha=0.99)
+
+            st.write(f"VaR 95%: {var95:,.0f}")
+            st.write(f"ES 95%: {es95:,.0f}")
+            st.write(f"VaR 99%: {var99:,.0f}")
+            st.write(f"ES 99%: {es99:,.0f}")
+
+            st.plotly_chart(
+                px.histogram(x=pnl, nbins=50, title="PnL Verteilung Monte Carlo"),
+                use_container_width=True,
+            )
+
 
 if __name__ == "__main__":
     main()
 
 # python -m streamlit run greeks_at_risk_dashboard.py
+
